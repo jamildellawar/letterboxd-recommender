@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 data/raw/
 data/processed/
+data/history/
 models/
 *.egg-info/
 .ipynb_checkpoints/
