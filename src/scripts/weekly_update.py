@@ -1,10 +1,11 @@
-"""Weekly pipeline: check for new watches, refresh catalog, regenerate recs."""
+"""Periodic pipeline: fetch new watches via RSS, merge into catalog, regenerate recs."""
 
 import pandas as pd
 
-from src.config import RAW_DIR, PROCESSED_DIR
+from src.config import PROCESSED_DIR
 from src.data.letterboxd import fetch_rss
-from src.data.tmdb import enrich_all, fetch_popular_movies
+from src.data.tmdb import enrich_all
+from src.data.tmdb import fetch_popular_movies
 from src.data.history import detect_feedback, save_run, save_feedback, feedback_metrics, load_all_history
 from src.features.vectorize import MovieVectorizer
 from src.features.profile import profile_summary
@@ -14,43 +15,70 @@ from src.deploy.dynamo_writer import write_recommendations, write_genre_picks, w
 
 
 def main():
-    cache_path = RAW_DIR / "letterboxd_history.parquet"
     output_path = PROCESSED_DIR / "rated_movies.parquet"
 
-    # Capture previous rated IDs before rebuilding catalog
-    previous_rated_ids: set = set()
+    # Load existing catalog (built from CSV export or previous runs)
     if output_path.exists():
-        old_rated = pd.read_parquet(output_path)
-        if "tmdb_id" in old_rated.columns:
-            previous_rated_ids = set(old_rated["tmdb_id"].values)
-        print(f"Previous catalog: {len(previous_rated_ids)} rated movies")
+        existing_df = pd.read_parquet(output_path)
+        previous_rated_ids = set(existing_df["tmdb_id"].values)
+        existing_slugs = set(existing_df["filmSlug"].values) if "filmSlug" in existing_df.columns else set()
+        print(f"Existing catalog: {len(existing_df)} rated movies")
+    else:
+        existing_df = pd.DataFrame()
+        previous_rated_ids = set()
+        existing_slugs = set()
+        print("No existing catalog — will build from RSS.")
 
     # Fetch latest from RSS
-    print("Fetching latest Letterboxd ratings from RSS...")
+    print("\nFetching latest Letterboxd ratings from RSS...")
     rss = fetch_rss()
-    new_df = pd.DataFrame(rss)
-    new_df = new_df[new_df["memberRating"] > 0].copy()
-    if "filmSlug" not in new_df.columns:
-        new_df["filmSlug"] = new_df["filmTitle"].str.lower().str.replace(r"[^a-z0-9]+", "-", regex=True)
-    print(f"Found {len(new_df)} rated films in RSS feed")
+    rss_df = pd.DataFrame(rss)
+    rss_df = rss_df[rss_df["memberRating"] > 0].copy()
+    if "filmSlug" not in rss_df.columns:
+        rss_df["filmSlug"] = rss_df["filmTitle"].str.lower().str.replace(r"[^a-z0-9]+", "-", regex=True)
+    print(f"Found {len(rss_df)} rated films in RSS feed")
 
-    # Compare with cached version
-    if cache_path.exists():
-        old_df = pd.read_parquet(cache_path)
-        old_slugs = set(old_df["filmSlug"].values)
-        new_slugs = set(new_df["filmSlug"].values)
-        added = new_slugs - old_slugs
-        print(f"New films since last run: {len(added)}")
+    # Find new movies not already in the catalog
+    new_movies = rss_df[~rss_df["filmSlug"].isin(existing_slugs)].copy()
+    print(f"New films to add: {len(new_movies)}")
+
+    # Check for re-ratings (same slug, different rating)
+    if not existing_df.empty and "filmSlug" in existing_df.columns:
+        overlap = rss_df[rss_df["filmSlug"].isin(existing_slugs)]
+        updated = 0
+        for _, rss_row in overlap.iterrows():
+            slug = rss_row["filmSlug"]
+            mask = existing_df["filmSlug"] == slug
+            if mask.any():
+                old_rating = existing_df.loc[mask, "memberRating"].iloc[0]
+                if abs(old_rating - rss_row["memberRating"]) > 0.01:
+                    existing_df.loc[mask, "memberRating"] = rss_row["memberRating"]
+                    updated += 1
+        if updated > 0:
+            print(f"Updated {updated} re-rated films")
+
+    # Enrich only the new movies with TMDB metadata
+    if not new_movies.empty:
+        print(f"\nEnriching {len(new_movies)} new movies with TMDB metadata...")
+        new_enriched = enrich_all(new_movies)
+        new_enriched_df = pd.DataFrame(new_enriched)
+
+        if not new_enriched_df.empty:
+            # Merge into existing catalog
+            enriched_df = pd.concat([existing_df, new_enriched_df], ignore_index=True)
+            # Deduplicate by tmdb_id (keep latest in case of re-enrichment)
+            enriched_df = enriched_df.drop_duplicates(subset="tmdb_id", keep="last")
+        else:
+            enriched_df = existing_df
     else:
-        print("No cached history — building from scratch.")
+        print("\nNo new movies to enrich.")
+        enriched_df = existing_df
 
-    # Update cache
-    new_df.to_parquet(cache_path, index=False)
+    if enriched_df.empty:
+        print("Error: No rated movies in catalog. Run build_catalog.py first.")
+        return
 
-    # Enrich with TMDB
-    print("\nEnriching with TMDB metadata...")
-    enriched = enrich_all(new_df)
-    enriched_df = pd.DataFrame(enriched)
+    # Save updated catalog
     enriched_df.to_parquet(output_path, index=False)
     print(f"Updated catalog: {len(enriched_df)} movies")
 
@@ -117,7 +145,7 @@ def main():
     print("\n--- Saving History ---")
     save_run(recs, genre_picks)
 
-    print("\nWeekly update complete!")
+    print("\nUpdate complete!")
 
 
 if __name__ == "__main__":
