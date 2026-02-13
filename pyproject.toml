@@ -27,6 +27,12 @@ dev = [
     "matplotlib>=3.8",
     "seaborn>=0.13",
 ]
+ml = [
+    "lightfm>=1.17",
+    "torch>=2.0",
+    "onnx>=1.15",
+    "onnxruntime>=1.17",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

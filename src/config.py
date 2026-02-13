@@ -14,6 +14,7 @@ RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 MODELS_DIR = PROJECT_ROOT / "models"
 HISTORY_DIR = DATA_DIR / "history"
+MOVIELENS_DIR = RAW_DIR / "ml-25m"
 
 for d in [RAW_DIR, PROCESSED_DIR, MODELS_DIR, HISTORY_DIR]:
     d.mkdir(parents=True, exist_ok=True)

@@ -111,6 +111,43 @@ def write_genre_picks(picks_df: pd.DataFrame) -> int:
     return count
 
 
+def write_streaming_picks(picks_df: pd.DataFrame) -> int:
+    """Write streaming picks to DynamoDB LetterboxdRecs table.
+
+    Uses pk="STREAMING" to distinguish from main recs and genre picks.
+    """
+    dynamodb = get_dynamodb_resource()
+    table = dynamodb.Table(LETTERBOXD_RECS_TABLE)
+    now = datetime.now(timezone.utc).isoformat()
+
+    _clear_table(table, "STREAMING")
+
+    count = 0
+    with table.batch_writer() as batch:
+        for _, row in picks_df.iterrows():
+            item = {
+                "pk": "STREAMING",
+                "tmdb_id": str(row["tmdb_id"]),
+                "title": row["title"],
+                "year": int(row["year"]) if pd.notna(row.get("year")) else 0,
+                "similarity_score": _convert_floats(float(row["similarity_score"])),
+                "genres": row.get("genres", []),
+                "director": row.get("director", []),
+                "cast_preview": (row.get("cast") or [])[:3],
+                "poster_url": row.get("poster_url", ""),
+                "tmdb_url": row.get("tmdb_url", ""),
+                "letterboxd_url": row.get("letterboxd_url", ""),
+                "explanation": row.get("explanation", []),
+                "streaming_services": row.get("streaming_services", []),
+                "generated_at": now,
+            }
+            batch.put_item(Item=item)
+            count += 1
+
+    print(f"Wrote {count} streaming picks to {LETTERBOXD_RECS_TABLE}")
+    return count
+
+
 def write_profile(profile_summary: dict) -> None:
     """Write user taste profile summary to DynamoDB LetterboxdProfile table.
 

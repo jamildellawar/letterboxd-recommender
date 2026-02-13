@@ -35,6 +35,56 @@ def _tmdb_get(endpoint: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
+# TMDB Watch Provider IDs (powered by JustWatch data)
+STREAMING_PROVIDERS: dict[int, str] = {
+    8: "Netflix",
+    9: "Amazon Prime Video",
+    119: "Amazon Prime Video",
+    1899: "Max",
+    384: "Max",
+}
+
+
+def fetch_watch_providers(tmdb_ids: list[int], country: str = "US") -> dict[int, list[str]]:
+    """Look up which streaming services carry each movie.
+
+    Calls GET /movie/{id}/watch/providers for each ID.
+    Returns dict mapping tmdb_id -> list of provider names (e.g. ["Netflix", "Max"]).
+    Only includes movies available via flatrate (subscription) streaming.
+    """
+    result: dict[int, list[str]] = {}
+    total = len(tmdb_ids)
+
+    for i, tmdb_id in enumerate(tmdb_ids):
+        try:
+            data = _tmdb_get(f"/movie/{tmdb_id}/watch/providers")
+            country_data = data.get("results", {}).get(country, {})
+            flatrate = country_data.get("flatrate", [])
+
+            providers: list[str] = []
+            seen_names: set[str] = set()
+            for entry in flatrate:
+                provider_id = entry.get("provider_id")
+                if provider_id in STREAMING_PROVIDERS:
+                    name = STREAMING_PROVIDERS[provider_id]
+                    if name not in seen_names:
+                        providers.append(name)
+                        seen_names.add(name)
+
+            if providers:
+                result[tmdb_id] = providers
+        except requests.HTTPError:
+            pass
+
+        if (i + 1) % 50 == 0:
+            print(f"  Watch providers: checked {i + 1}/{total}...")
+
+        time.sleep(0.05)
+
+    print(f"Found {len(result)}/{total} movies on streaming services")
+    return result
+
+
 def search_movie(title: str, year: int | None = None) -> dict | None:
     """Search TMDB for a movie by title and optional year.
 

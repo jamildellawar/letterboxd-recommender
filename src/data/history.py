@@ -9,7 +9,7 @@ import pandas as pd
 from src.config import HISTORY_DIR
 
 
-def save_run(recs_df: pd.DataFrame, genre_picks_df: pd.DataFrame) -> None:
+def save_run(recs_df: pd.DataFrame, genre_picks_df: pd.DataFrame, streaming_picks_df: pd.DataFrame | None = None) -> None:
     """Save this run's recommendations to a dated parquet file."""
     today = date.today().isoformat()
     rows = []
@@ -35,6 +35,18 @@ def save_run(recs_df: pd.DataFrame, genre_picks_df: pd.DataFrame) -> None:
             "picked_genre": row.get("picked_genre"),
             "run_date": today,
         })
+
+    if streaming_picks_df is not None:
+        for _, row in streaming_picks_df.iterrows():
+            rows.append({
+                "tmdb_id": row["tmdb_id"],
+                "title": row.get("title", ""),
+                "year": row.get("year"),
+                "similarity_score": row.get("similarity_score", 0.0),
+                "rec_type": "streaming",
+                "picked_genre": None,
+                "run_date": today,
+            })
 
     if not rows:
         return

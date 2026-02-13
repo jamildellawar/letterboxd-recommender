@@ -17,17 +17,22 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev]" scipy
 
-      - name: Restore catalog and history
+      - name: Restore catalog, history, and MovieLens data
         uses: actions/cache@v4
         with:
           path: |
             data/processed/
             data/raw/tmdb_cache.json
+            data/raw/ml-25m/
             data/history/
+            models/
           key: rec-data-${{ github.run_id }}
           restore-keys: rec-data-
+
+      - name: Download MovieLens data
+        run: python -m src.scripts.download_movielens
 
       - name: Run recommendation update
         env:
@@ -35,4 +40,5 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
+          GUEST_CACHE_BUCKET: ${{ secrets.GUEST_CACHE_BUCKET }}
         run: python -m src.scripts.weekly_update

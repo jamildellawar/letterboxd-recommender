@@ -220,6 +220,121 @@ def generate_genre_picks(
     return result.reset_index(drop=True)
 
 
+def get_top_candidate_ids(
+    rated_df: pd.DataFrame,
+    candidates_df: pd.DataFrame,
+    vectorizer: MovieVectorizer,
+    top_n: int = 150,
+    feedback_adjustment: np.ndarray | None = None,
+) -> list[int]:
+    """Return top-N candidate tmdb_ids by blended taste+quality score.
+
+    Used to build a shortlist for streaming availability checks,
+    avoiding API calls on low-scoring movies.
+    """
+    rated_vectors = vectorizer.transform(rated_df)
+    taste_profile = build_taste_profile(rated_vectors, rated_df["memberRating"])
+    taste_profile = apply_feedback_to_profile(taste_profile, feedback_adjustment)
+
+    watched_ids = set(rated_df["tmdb_id"].values)
+    unseen = candidates_df[~candidates_df["tmdb_id"].isin(watched_ids)].copy()
+
+    if unseen.empty:
+        return []
+
+    vote_counts = unseen["vote_count"].fillna(0) if "vote_count" in unseen.columns else pd.Series(0, index=unseen.index)
+    unseen = unseen[vote_counts >= MIN_VOTE_COUNT].copy()
+
+    if unseen.empty:
+        return []
+
+    candidate_vectors = vectorizer.transform(unseen)
+    taste_scores = cosine_similarity(candidate_vectors, taste_profile.reshape(1, -1)).flatten()
+
+    vote_avg = unseen["vote_average"].fillna(0).values if "vote_average" in unseen.columns else np.zeros(len(unseen))
+    vote_cnt = unseen["vote_count"].fillna(0).values if "vote_count" in unseen.columns else np.ones(len(unseen))
+    quality_raw = _bayesian_rating(vote_avg, vote_cnt)
+    q_min, q_max = quality_raw.min(), quality_raw.max()
+    quality_norm = (quality_raw - q_min) / (q_max - q_min) if q_max > q_min else np.ones_like(quality_raw)
+
+    t_min, t_max = taste_scores.min(), taste_scores.max()
+    taste_norm = (taste_scores - t_min) / (t_max - t_min) if t_max > t_min else np.ones_like(taste_scores)
+
+    blended = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
+
+    top_indices = np.argsort(blended)[::-1][:top_n]
+    return [int(unseen.iloc[i]["tmdb_id"]) for i in top_indices]
+
+
+def generate_streaming_picks(
+    rated_df: pd.DataFrame,
+    candidates_df: pd.DataFrame,
+    vectorizer: MovieVectorizer,
+    streaming_map: dict[int, list[str]],
+    top_n: int = 20,
+    feedback_adjustment: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Generate top streaming picks from movies available on Netflix, Max, or Prime.
+
+    Scores all candidates with the same taste+quality blend, then filters
+    to those present in streaming_map. No MMR — the pool is already small.
+    """
+    rated_vectors = vectorizer.transform(rated_df)
+    taste_profile = build_taste_profile(rated_vectors, rated_df["memberRating"])
+    taste_profile = apply_feedback_to_profile(taste_profile, feedback_adjustment)
+
+    watched_ids = set(rated_df["tmdb_id"].values)
+    unseen = candidates_df[~candidates_df["tmdb_id"].isin(watched_ids)].copy()
+
+    if unseen.empty:
+        return pd.DataFrame()
+
+    vote_counts = unseen["vote_count"].fillna(0) if "vote_count" in unseen.columns else pd.Series(0, index=unseen.index)
+    unseen = unseen[vote_counts >= MIN_VOTE_COUNT].copy()
+
+    if unseen.empty:
+        return pd.DataFrame()
+
+    # Filter to movies that are actually streaming
+    streaming_ids = set(streaming_map.keys())
+    unseen = unseen[unseen["tmdb_id"].isin(streaming_ids)].copy()
+
+    if unseen.empty:
+        print("  No streaming candidates found after filtering.")
+        return pd.DataFrame()
+
+    candidate_vectors = vectorizer.transform(unseen)
+    taste_scores = cosine_similarity(candidate_vectors, taste_profile.reshape(1, -1)).flatten()
+
+    vote_avg = unseen["vote_average"].fillna(0).values if "vote_average" in unseen.columns else np.zeros(len(unseen))
+    vote_cnt = unseen["vote_count"].fillna(0).values if "vote_count" in unseen.columns else np.ones(len(unseen))
+    quality_raw = _bayesian_rating(vote_avg, vote_cnt)
+    q_min, q_max = quality_raw.min(), quality_raw.max()
+    quality_norm = (quality_raw - q_min) / (q_max - q_min) if q_max > q_min else np.ones_like(quality_raw)
+
+    t_min, t_max = taste_scores.min(), taste_scores.max()
+    taste_norm = (taste_scores - t_min) / (t_max - t_min) if t_max > t_min else np.ones_like(taste_scores)
+
+    blended = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
+
+    unseen = unseen.copy()
+    unseen["similarity_score"] = taste_scores
+    unseen["_blended_score"] = blended
+    unseen["streaming_services"] = unseen["tmdb_id"].map(streaming_map)
+
+    # Sort by blended score, take top_n
+    unseen = unseen.sort_values("_blended_score", ascending=False).head(top_n)
+
+    # Generate explanations
+    unseen["explanation"] = unseen.apply(
+        lambda row: _explain_recommendation(row, rated_df), axis=1
+    )
+
+    unseen = unseen.drop(columns=["_blended_score"])
+    print(f"  Generated {len(unseen)} streaming picks")
+    return unseen.reset_index(drop=True)
+
+
 def _mmr_rerank(
     scores: np.ndarray,
     vectors: np.ndarray,

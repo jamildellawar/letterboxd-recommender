@@ -322,32 +322,60 @@ def _title_to_slug(title: str) -> str:
     return slug
 
 
+def _check_letterboxd_url(url: str, expected_year: int | None = None) -> bool:
+    """Check if a Letterboxd URL exists and optionally verify the release year.
+
+    If expected_year is provided, fetches the page and checks the year matches
+    to avoid resolving to a different film with the same title.
+    """
+    try:
+        if expected_year:
+            resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
+            if resp.status_code != 200:
+                return False
+            # Check year in the page content
+            year_match = re.search(
+                r'<a\s+href="/films/year/(\d{4})/"', resp.text
+            )
+            if year_match:
+                page_year = int(year_match.group(1))
+                return page_year == expected_year
+            # If we can't find a year, accept it as a match
+            return True
+        else:
+            resp = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
+            return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
 def resolve_letterboxd_url(title: str, year: int | None = None) -> str:
     """Resolve the correct Letterboxd film URL.
 
-    Tries slug-year first (to avoid hitting an older film with the same title),
-    then plain slug, then falls back to search URL.
+    Tries candidates in order:
+    1. Plain slug — verify year matches (avoids wrong film with same name)
+    2. slug-year (e.g. "let-go-2024")
+    3. slug-year-1 through slug-year-3 (disambiguation suffixes)
+    Falls back to search URL if nothing matches.
     """
     slug = _title_to_slug(title)
 
-    # Try slug-year first (avoids collisions like "the-color-purple" vs "the-color-purple-2023")
+    # 1. Try plain slug (verify year if available to avoid wrong film)
+    url_plain = f"https://letterboxd.com/film/{slug}/"
+    if _check_letterboxd_url(url_plain, expected_year=year):
+        return url_plain
+
+    # 2. Try slug-year
     if year:
         url_year = f"https://letterboxd.com/film/{slug}-{year}/"
-        try:
-            resp = requests.head(url_year, headers=HEADERS, timeout=10, allow_redirects=True)
-            if resp.status_code == 200:
-                return url_year
-        except requests.RequestException:
-            pass
+        if _check_letterboxd_url(url_year):
+            return url_year
 
-    # Try plain slug
-    url = f"https://letterboxd.com/film/{slug}/"
-    try:
-        resp = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
-        if resp.status_code == 200:
-            return url
-    except requests.RequestException:
-        pass
+        # 3. Try disambiguation suffixes: slug-year-1, slug-year-2, slug-year-3
+        for suffix in range(1, 4):
+            url_disambig = f"https://letterboxd.com/film/{slug}-{year}-{suffix}/"
+            if _check_letterboxd_url(url_disambig):
+                return url_disambig
 
     # Fallback to search
     return f"https://letterboxd.com/search/{slug}/"

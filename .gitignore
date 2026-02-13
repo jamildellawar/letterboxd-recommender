@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 data/raw/
+data/raw/ml-25m.zip
 data/processed/
 data/history/
 models/

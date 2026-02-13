@@ -8,10 +8,11 @@ from src.data.history import detect_feedback, save_run, save_feedback, feedback_
 from src.features.vectorize import MovieVectorizer
 from src.features.profile import profile_summary
 from src.features.feedback import compute_feedback_adjustment
-from src.model.recommend import generate_recommendations, generate_genre_picks
+from src.model.recommend import generate_recommendations, generate_genre_picks, get_top_candidate_ids, generate_streaming_picks
 from src.model.evaluate import leave_one_out_eval, rating_correlation
 from src.data.letterboxd import resolve_letterboxd_urls, fetch_letterboxd_ratings
-from src.deploy.dynamo_writer import write_recommendations, write_genre_picks, write_profile
+from src.data.tmdb import fetch_watch_providers
+from src.deploy.dynamo_writer import write_recommendations, write_genre_picks, write_streaming_picks, write_profile
 
 
 def main():
@@ -80,12 +81,20 @@ def main():
     main_rec_ids = set(recs["tmdb_id"].values)
     genre_picks = generate_genre_picks(rated_df, candidates_df, vectorizer, exclude_ids=main_rec_ids, feedback_adjustment=feedback_adj)
 
-    # Resolve Letterboxd URLs for both sets
+    # Generate streaming picks
+    print("\n--- Generating Streaming Picks ---")
+    shortlist_ids = get_top_candidate_ids(rated_df, candidates_df, vectorizer, 150, feedback_adj)
+    streaming_map = fetch_watch_providers(shortlist_ids)
+    streaming_picks = generate_streaming_picks(rated_df, candidates_df, vectorizer, streaming_map, feedback_adjustment=feedback_adj)
+
+    # Resolve Letterboxd URLs for all sets
     print("\n--- Resolving Letterboxd URLs ---")
-    all_recs = pd.concat([recs, genre_picks], ignore_index=True).drop_duplicates(subset="tmdb_id")
+    all_recs = pd.concat([recs, genre_picks, streaming_picks], ignore_index=True).drop_duplicates(subset="tmdb_id")
     url_map = resolve_letterboxd_urls(all_recs)
     recs["letterboxd_url"] = recs["tmdb_id"].astype(str).map(url_map)
     genre_picks["letterboxd_url"] = genre_picks["tmdb_id"].astype(str).map(url_map)
+    if not streaming_picks.empty:
+        streaming_picks["letterboxd_url"] = streaming_picks["tmdb_id"].astype(str).map(url_map)
 
     # Fetch Letterboxd community ratings for quality re-ranking
     print("\n--- Fetching Letterboxd Ratings ---")
@@ -95,6 +104,8 @@ def main():
     print("\n--- Re-ranking with Letterboxd Ratings ---")
     recs = _rerank_with_letterboxd(recs, lb_ratings)
     genre_picks = _rerank_genre_picks_with_letterboxd(genre_picks, lb_ratings)
+    if not streaming_picks.empty:
+        streaming_picks = _rerank_with_letterboxd(streaming_picks, lb_ratings)
 
     print(f"Top 10 recommendations (after Letterboxd re-rank):")
     for i, (_, row) in enumerate(recs.head(10).iterrows()):
@@ -112,17 +123,26 @@ def main():
         print(f"  [{row['picked_genre']}] {row['title']} ({row.get('year', '?')}) "
               f"- sim={row['similarity_score']:.3f} LB={lb_str}/5")
 
+    print(f"\nStreaming picks ({len(streaming_picks)}):")
+    for _, row in streaming_picks.iterrows():
+        services = ", ".join(row.get("streaming_services", []))
+        print(f"  {row['title']} ({row.get('year', '?')}) "
+              f"- sim={row['similarity_score']:.3f} "
+              f"- [{services}]")
+
     # Write to DynamoDB
     print("\n--- Writing to DynamoDB ---")
     write_recommendations(recs)
     write_genre_picks(genre_picks)
+    if not streaming_picks.empty:
+        write_streaming_picks(streaming_picks)
 
     summary = profile_summary(rated_df)
     write_profile(summary)
 
     # Save recommendation history
     print("\n--- Saving History ---")
-    save_run(recs, genre_picks)
+    save_run(recs, genre_picks, streaming_picks if not streaming_picks.empty else None)
 
     print("\nDone!")
 
