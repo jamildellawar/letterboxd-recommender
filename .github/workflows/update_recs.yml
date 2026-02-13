@@ -1,0 +1,35 @@
+name: Recommendation Update
+
+on:
+  schedule:
+    - cron: '0 11 */2 * *'  # Every 2 days at 6 AM ET (11:00 UTC)
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Restore recommendation history
+        uses: actions/cache@v4
+        with:
+          path: data/history/
+          key: rec-history-${{ github.run_id }}
+          restore-keys: rec-history-
+
+      - name: Run recommendation update
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: python -m src.scripts.weekly_update
