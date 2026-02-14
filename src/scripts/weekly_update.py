@@ -127,21 +127,60 @@ def main():
     candidates = fetch_popular_movies(pages=50)
     candidates_df = pd.DataFrame(candidates)
 
-    print("Generating recommendations...")
-    recs = generate_recommendations(enriched_df, candidates_df, vectorizer, feedback_adjustment=feedback_adj)
+    # Fetch Letterboxd community ratings BEFORE generating recs (used for quality scoring)
+    print("\n--- Fetching Letterboxd Community Ratings ---")
+    print("Resolving Letterboxd URLs for candidates...")
+    url_map = resolve_letterboxd_urls(candidates_df)
+    print("Fetching community ratings...")
+    rating_map = fetch_letterboxd_ratings(url_map)
+    candidates_df["letterboxd_rating"] = candidates_df["tmdb_id"].apply(
+        lambda tid: rating_map.get(str(tid), None)
+    )
+    rated_count = candidates_df["letterboxd_rating"].notna().sum()
+    print(f"  {rated_count}/{len(candidates_df)} candidates have Letterboxd ratings")
+
+    # Train KNN CF model for blending
+    cf_model = None
+    try:
+        from src.data.movielens import download_movielens, load_ratings, build_id_mappings, build_user_item_matrix
+        from src.model.knn_cf import KNNCFModel
+
+        print("\n--- Training KNN CF Model ---")
+        download_movielens()
+        ml_ratings = load_ratings()
+        id_mappings = build_id_mappings(candidates_df)
+
+        valid_ml_ids = set(id_mappings["tmdb_to_ml"].values())
+        matrix_data = build_user_item_matrix(ml_ratings, valid_ml_ids)
+
+        cf_model = KNNCFModel(k=50)
+        cf_model.fit(
+            matrix_data["matrix"],
+            matrix_data["movie_id_to_idx"],
+            matrix_data["movie_idx_to_id"],
+            id_mappings["ml_to_tmdb"],
+            id_mappings["tmdb_to_ml"],
+        )
+        print("  KNN CF model ready for blending")
+    except Exception as e:
+        print(f"  KNN CF training failed (non-fatal): {e}")
+        cf_model = None
+
+    print("\nGenerating recommendations...")
+    recs = generate_recommendations(enriched_df, candidates_df, vectorizer, feedback_adjustment=feedback_adj, cf_model=cf_model)
     print(f"Generated {len(recs)} recommendations")
 
     # Generate genre picks
     print("Generating genre picks...")
     main_rec_ids = set(recs["tmdb_id"].values)
-    genre_picks = generate_genre_picks(enriched_df, candidates_df, vectorizer, exclude_ids=main_rec_ids, feedback_adjustment=feedback_adj)
+    genre_picks = generate_genre_picks(enriched_df, candidates_df, vectorizer, exclude_ids=main_rec_ids, feedback_adjustment=feedback_adj, cf_model=cf_model)
     print(f"Generated {len(genre_picks)} genre picks")
 
     # Generate streaming picks
     print("Generating streaming picks...")
-    shortlist_ids = get_top_candidate_ids(enriched_df, candidates_df, vectorizer, 150, feedback_adj)
+    shortlist_ids = get_top_candidate_ids(enriched_df, candidates_df, vectorizer, 150, feedback_adj, cf_model=cf_model)
     streaming_map = fetch_watch_providers(shortlist_ids)
-    streaming_picks = generate_streaming_picks(enriched_df, candidates_df, vectorizer, streaming_map, feedback_adjustment=feedback_adj)
+    streaming_picks = generate_streaming_picks(enriched_df, candidates_df, vectorizer, streaming_map, feedback_adjustment=feedback_adj, cf_model=cf_model)
     print(f"Generated {len(streaming_picks)} streaming picks")
 
     # Write to DynamoDB
@@ -157,18 +196,6 @@ def main():
     # Save recommendation history
     print("\n--- Saving History ---")
     save_run(recs, genre_picks, streaming_picks if not streaming_picks.empty else None)
-
-    # Enrich candidates with Letterboxd community ratings for guest recs
-    print("\n--- Fetching Letterboxd Community Ratings ---")
-    print("Resolving Letterboxd URLs for candidates...")
-    url_map = resolve_letterboxd_urls(candidates_df)
-    print("Fetching community ratings...")
-    rating_map = fetch_letterboxd_ratings(url_map)
-    candidates_df["letterboxd_rating"] = candidates_df["tmdb_id"].apply(
-        lambda tid: rating_map.get(str(tid), None)
-    )
-    rated_count = candidates_df["letterboxd_rating"].notna().sum()
-    print(f"  {rated_count}/{len(candidates_df)} candidates have Letterboxd ratings")
 
     # Upload cache to S3 for guest recommendations Lambda
     guest_bucket = os.environ.get("GUEST_CACHE_BUCKET")
@@ -188,40 +215,17 @@ def main():
         s3.upload_file(str(candidates_path), guest_bucket, "candidates.parquet")
         print(f"  Uploaded candidates.parquet ({len(candidates_df)} movies)")
 
-        # Train and upload CF model artifacts
-        print("\n--- Training CF Model ---")
-        try:
-            from src.data.movielens import download_movielens, load_ratings, build_id_mappings, build_user_item_matrix
-            from src.model.knn_cf import KNNCFModel
-
-            download_movielens()
-            ml_ratings = load_ratings()
-            id_mappings = build_id_mappings(candidates_df)
-
-            valid_ml_ids = set(id_mappings["tmdb_to_ml"].values())
-            matrix_data = build_user_item_matrix(ml_ratings, valid_ml_ids)
-
-            knn_model = KNNCFModel(k=50)
-            knn_model.fit(
-                matrix_data["matrix"],
-                matrix_data["movie_id_to_idx"],
-                matrix_data["movie_idx_to_id"],
-                id_mappings["ml_to_tmdb"],
-                id_mappings["tmdb_to_ml"],
-            )
-
+        # Upload CF model artifacts to S3 (already trained earlier)
+        if cf_model is not None:
             from src.config import MODELS_DIR
             knn_dir = MODELS_DIR / "knn_cf"
-            knn_model.save_artifacts(knn_dir)
+            cf_model.save_artifacts(knn_dir)
 
-            # Upload model artifacts to S3
             for artifact_file in knn_dir.iterdir():
                 s3_key = f"models/knn_cf/{artifact_file.name}"
                 s3.upload_file(str(artifact_file), guest_bucket, s3_key)
                 size_mb = artifact_file.stat().st_size / (1024 * 1024)
                 print(f"  Uploaded {s3_key} ({size_mb:.1f} MB)")
-        except Exception as e:
-            print(f"  CF model training failed (non-fatal): {e}")
     else:
         print("\nSkipping guest cache upload (GUEST_CACHE_BUCKET not set)")
 

@@ -14,23 +14,77 @@ from src.features.feedback import apply_feedback_to_profile
 
 # Quality thresholds
 MIN_VOTE_COUNT = 50       # filter out niche films with inflated ratings
-QUALITY_BLEND = 0.25      # 25% TMDB quality, 75% taste similarity
+QUALITY_BLEND = 0.20      # 20% quality signal in three-way blend (50/30/20)
+
+
+def _get_cf_scores(cf_model, rated_df: pd.DataFrame, unseen: pd.DataFrame) -> np.ndarray | None:
+    """Get normalized CF scores for unseen movies, or None if unavailable."""
+    if cf_model is None:
+        return None
+
+    guest_ratings = dict(zip(
+        rated_df["tmdb_id"].astype(int),
+        rated_df["memberRating"].astype(float),
+    ))
+    candidate_ids = set(int(x) for x in unseen["tmdb_id"].values)
+
+    try:
+        cf_raw = cf_model.predict(guest_ratings, candidate_ids)
+    except Exception as e:
+        print(f"  CF prediction failed: {e}")
+        return None
+
+    if not cf_raw:
+        return None
+
+    cf_scores = np.zeros(len(unseen))
+    for i, tid in enumerate(unseen["tmdb_id"].values):
+        cf_scores[i] = cf_raw.get(int(tid), 0.0)
+
+    c_min, c_max = cf_scores.min(), cf_scores.max()
+    if c_max > c_min:
+        cf_scores = (cf_scores - c_min) / (c_max - c_min)
+    else:
+        return None
+
+    scored = (cf_scores > 0).sum()
+    print(f"  CF scores: {scored}/{len(unseen)} candidates scored")
+    return cf_scores
 
 
 def _bayesian_rating(vote_avg: np.ndarray, vote_count: np.ndarray) -> np.ndarray:
-    """IMDB-style weighted rating that penalizes films with few votes.
-
-    Formula: WR = (v / (v + m)) * R + (m / (v + m)) * C
-    where m = median vote count, C = mean vote average.
-
-    This pulls niche films with inflated ratings (e.g. Gabriel's Inferno
-    with 1K votes and 8.4 avg) toward the pool mean, while films with
-    10K+ votes keep their actual rating.
-    """
+    """IMDB-style weighted rating that penalizes films with few votes."""
     m = np.median(vote_count[vote_count > 0]) if (vote_count > 0).any() else 1000.0
     c = np.mean(vote_avg[vote_avg > 0]) if (vote_avg > 0).any() else 6.5
     weighted = (vote_count / (vote_count + m)) * vote_avg + (m / (vote_count + m)) * c
     return weighted
+
+
+def _quality_scores(unseen: pd.DataFrame) -> np.ndarray:
+    """Compute quality scores, preferring Letterboxd community ratings over TMDB.
+
+    Letterboxd ratings (0-5) are normalized to [0, 1].
+    Falls back to TMDB Bayesian rating for movies without Letterboxd data.
+    """
+    n = len(unseen)
+    scores = np.zeros(n)
+
+    has_lb = "letterboxd_rating" in unseen.columns
+    lb_ratings = unseen["letterboxd_rating"].values if has_lb else np.full(n, np.nan)
+
+    vote_avg = unseen["vote_average"].fillna(0).values if "vote_average" in unseen.columns else np.zeros(n)
+    vote_cnt = unseen["vote_count"].fillna(0).values if "vote_count" in unseen.columns else np.ones(n)
+
+    tmdb_bayesian = _bayesian_rating(vote_avg, vote_cnt)
+
+    for i in range(n):
+        lb = lb_ratings[i] if has_lb else np.nan
+        if not np.isnan(lb) and lb > 0:
+            scores[i] = lb / 5.0
+        else:
+            scores[i] = tmdb_bayesian[i] / 10.0
+
+    return scores
 
 
 def generate_recommendations(
@@ -40,14 +94,16 @@ def generate_recommendations(
     top_n: int = TOP_N_RECOMMENDATIONS,
     mmr_lambda: float = 0.7,
     feedback_adjustment: np.ndarray | None = None,
+    cf_model=None,
 ) -> pd.DataFrame:
     """Generate movie recommendations.
 
     Pipeline:
     1. Filter candidates by minimum vote count (removes niche/inflated-rating films)
     2. Score by cosine similarity to taste profile
-    3. Blend with TMDB quality signal (vote_average * log(vote_count))
-    4. MMR re-ranking for diversity
+    3. Optionally blend with CF scores (collaborative filtering)
+    4. Blend with TMDB quality signal
+    5. MMR re-ranking for diversity
     """
     # Build user taste profile
     rated_vectors = vectorizer.transform(rated_df)
@@ -66,7 +122,17 @@ def generate_recommendations(
     vote_counts = unseen["vote_count"].fillna(0) if "vote_count" in unseen.columns else pd.Series(0, index=unseen.index)
     quality_mask = vote_counts >= MIN_VOTE_COUNT
     unseen = unseen[quality_mask].copy()
-    print(f"  After quality filter (>={MIN_VOTE_COUNT} votes): {len(unseen)} candidates")
+
+    # Drop movies with low Letterboxd community ratings
+    if "letterboxd_rating" in unseen.columns:
+        before = len(unseen)
+        lb_mask = unseen["letterboxd_rating"].isna() | (unseen["letterboxd_rating"] >= 3.0)
+        unseen = unseen[lb_mask].copy()
+        dropped = before - len(unseen)
+        if dropped > 0:
+            print(f"  Dropped {dropped} candidates with Letterboxd rating < 3.0")
+
+    print(f"  After quality filter: {len(unseen)} candidates")
 
     if unseen.empty:
         print("Warning: No candidates passed quality filter.")
@@ -76,15 +142,8 @@ def generate_recommendations(
     candidate_vectors = vectorizer.transform(unseen)
     taste_scores = cosine_similarity(candidate_vectors, taste_profile.reshape(1, -1)).flatten()
 
-    # Quality signal: Bayesian weighted rating (penalizes niche inflated ratings)
-    vote_avg = unseen["vote_average"].fillna(0).values if "vote_average" in unseen.columns else np.zeros(len(unseen))
-    vote_cnt = unseen["vote_count"].fillna(0).values if "vote_count" in unseen.columns else np.ones(len(unseen))
-    quality_raw = _bayesian_rating(vote_avg, vote_cnt)
-    q_min, q_max = quality_raw.min(), quality_raw.max()
-    if q_max > q_min:
-        quality_norm = (quality_raw - q_min) / (q_max - q_min)
-    else:
-        quality_norm = np.ones_like(quality_raw)
+    # Quality signal: prefer Letterboxd community ratings, fall back to TMDB Bayesian
+    quality_norm = _quality_scores(unseen)
 
     # Normalize taste scores to [0, 1]
     t_min, t_max = taste_scores.min(), taste_scores.max()
@@ -93,8 +152,16 @@ def generate_recommendations(
     else:
         taste_norm = np.ones_like(taste_scores)
 
-    # Blended score
-    blended_scores = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
+    # Get CF scores if model provided
+    cf_norm = _get_cf_scores(cf_model, rated_df, unseen)
+
+    if cf_norm is not None:
+        # Three-way blend: 50% taste + 30% CF + 20% quality
+        blended_scores = 0.50 * taste_norm + 0.30 * cf_norm + QUALITY_BLEND * quality_norm
+        print("  Using three-way blend: 50% taste + 30% CF + 20% quality")
+    else:
+        # Original: 75% taste + 25% quality
+        blended_scores = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
 
     # Pre-filter to top 100 by blended score
     shortlist_size = min(100, len(blended_scores))
@@ -128,6 +195,7 @@ def generate_genre_picks(
     n_genres: int = 10,
     exclude_ids: set | None = None,
     feedback_adjustment: np.ndarray | None = None,
+    cf_model=None,
 ) -> pd.DataFrame:
     """Generate one best recommendation per genre for the user's top genres.
 
@@ -159,23 +227,27 @@ def generate_genre_picks(
     vote_counts = unseen["vote_count"].fillna(0) if "vote_count" in unseen.columns else pd.Series(0, index=unseen.index)
     unseen = unseen[vote_counts >= MIN_VOTE_COUNT].copy()
 
+    # Drop movies with low Letterboxd community ratings
+    if "letterboxd_rating" in unseen.columns:
+        lb_mask = unseen["letterboxd_rating"].isna() | (unseen["letterboxd_rating"] >= 3.0)
+        unseen = unseen[lb_mask].copy()
+
     if unseen.empty:
         return pd.DataFrame()
 
     candidate_vectors = vectorizer.transform(unseen)
     taste_scores = cosine_similarity(candidate_vectors, taste_profile.reshape(1, -1)).flatten()
 
-    # Quality blend (same as main model) — favors well-known films over niche fan-favorites
-    vote_avg = unseen["vote_average"].fillna(0).values if "vote_average" in unseen.columns else np.zeros(len(unseen))
-    vote_cnt = unseen["vote_count"].fillna(0).values if "vote_count" in unseen.columns else np.ones(len(unseen))
-    quality_raw = _bayesian_rating(vote_avg, vote_cnt)
-    q_min, q_max = quality_raw.min(), quality_raw.max()
-    quality_norm = (quality_raw - q_min) / (q_max - q_min) if q_max > q_min else np.ones_like(quality_raw)
+    quality_norm = _quality_scores(unseen)
 
     t_min, t_max = taste_scores.min(), taste_scores.max()
     taste_norm = (taste_scores - t_min) / (t_max - t_min) if t_max > t_min else np.ones_like(taste_scores)
 
-    blended = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
+    cf_norm = _get_cf_scores(cf_model, rated_df, unseen)
+    if cf_norm is not None:
+        blended = 0.50 * taste_norm + 0.30 * cf_norm + QUALITY_BLEND * quality_norm
+    else:
+        blended = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
 
     unseen = unseen.copy()
     unseen["similarity_score"] = taste_scores
@@ -226,6 +298,7 @@ def get_top_candidate_ids(
     vectorizer: MovieVectorizer,
     top_n: int = 150,
     feedback_adjustment: np.ndarray | None = None,
+    cf_model=None,
 ) -> list[int]:
     """Return top-N candidate tmdb_ids by blended taste+quality score.
 
@@ -251,16 +324,16 @@ def get_top_candidate_ids(
     candidate_vectors = vectorizer.transform(unseen)
     taste_scores = cosine_similarity(candidate_vectors, taste_profile.reshape(1, -1)).flatten()
 
-    vote_avg = unseen["vote_average"].fillna(0).values if "vote_average" in unseen.columns else np.zeros(len(unseen))
-    vote_cnt = unseen["vote_count"].fillna(0).values if "vote_count" in unseen.columns else np.ones(len(unseen))
-    quality_raw = _bayesian_rating(vote_avg, vote_cnt)
-    q_min, q_max = quality_raw.min(), quality_raw.max()
-    quality_norm = (quality_raw - q_min) / (q_max - q_min) if q_max > q_min else np.ones_like(quality_raw)
+    quality_norm = _quality_scores(unseen)
 
     t_min, t_max = taste_scores.min(), taste_scores.max()
     taste_norm = (taste_scores - t_min) / (t_max - t_min) if t_max > t_min else np.ones_like(taste_scores)
 
-    blended = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
+    cf_norm = _get_cf_scores(cf_model, rated_df, unseen)
+    if cf_norm is not None:
+        blended = 0.50 * taste_norm + 0.30 * cf_norm + QUALITY_BLEND * quality_norm
+    else:
+        blended = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
 
     top_indices = np.argsort(blended)[::-1][:top_n]
     return [int(unseen.iloc[i]["tmdb_id"]) for i in top_indices]
@@ -273,6 +346,7 @@ def generate_streaming_picks(
     streaming_map: dict[int, list[str]],
     top_n: int = 20,
     feedback_adjustment: np.ndarray | None = None,
+    cf_model=None,
 ) -> pd.DataFrame:
     """Generate top streaming picks from movies available on Netflix, Max, or Prime.
 
@@ -295,6 +369,15 @@ def generate_streaming_picks(
     if unseen.empty:
         return pd.DataFrame()
 
+    # Drop movies with low Letterboxd community ratings
+    if "letterboxd_rating" in unseen.columns:
+        before = len(unseen)
+        lb_mask = unseen["letterboxd_rating"].isna() | (unseen["letterboxd_rating"] >= 3.0)
+        unseen = unseen[lb_mask].copy()
+        dropped = before - len(unseen)
+        if dropped > 0:
+            print(f"  Dropped {dropped} streaming candidates with Letterboxd rating < 3.0")
+
     # Filter to movies that are actually streaming
     streaming_ids = set(streaming_map.keys())
     unseen = unseen[unseen["tmdb_id"].isin(streaming_ids)].copy()
@@ -306,16 +389,16 @@ def generate_streaming_picks(
     candidate_vectors = vectorizer.transform(unseen)
     taste_scores = cosine_similarity(candidate_vectors, taste_profile.reshape(1, -1)).flatten()
 
-    vote_avg = unseen["vote_average"].fillna(0).values if "vote_average" in unseen.columns else np.zeros(len(unseen))
-    vote_cnt = unseen["vote_count"].fillna(0).values if "vote_count" in unseen.columns else np.ones(len(unseen))
-    quality_raw = _bayesian_rating(vote_avg, vote_cnt)
-    q_min, q_max = quality_raw.min(), quality_raw.max()
-    quality_norm = (quality_raw - q_min) / (q_max - q_min) if q_max > q_min else np.ones_like(quality_raw)
+    quality_norm = _quality_scores(unseen)
 
     t_min, t_max = taste_scores.min(), taste_scores.max()
     taste_norm = (taste_scores - t_min) / (t_max - t_min) if t_max > t_min else np.ones_like(taste_scores)
 
-    blended = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
+    cf_norm = _get_cf_scores(cf_model, rated_df, unseen)
+    if cf_norm is not None:
+        blended = 0.50 * taste_norm + 0.30 * cf_norm + QUALITY_BLEND * quality_norm
+    else:
+        blended = (1 - QUALITY_BLEND) * taste_norm + QUALITY_BLEND * quality_norm
 
     unseen = unseen.copy()
     unseen["similarity_score"] = taste_scores

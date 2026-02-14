@@ -174,12 +174,16 @@ def _rerank_with_letterboxd(recs_df: pd.DataFrame, lb_ratings: dict[str, float])
 
 
 def _rerank_genre_picks_with_letterboxd(picks_df: pd.DataFrame, lb_ratings: dict[str, float]) -> pd.DataFrame:
-    """Filter genre picks that have very low Letterboxd ratings."""
+    """Drop genre picks with low Letterboxd ratings."""
     picks_df = picks_df.copy()
     picks_df["lb_rating"] = picks_df["tmdb_id"].astype(str).map(lb_ratings)
 
-    # Flag but don't drop genre picks (we want one per genre)
-    # Instead, just note the rating — the main filtering happened via quality blend
+    before = len(picks_df)
+    picks_df = picks_df[picks_df["lb_rating"].isna() | (picks_df["lb_rating"] >= 3.0)]
+    dropped = before - len(picks_df)
+    if dropped > 0:
+        print(f"  Dropped {dropped} genre picks with Letterboxd rating < 3.0")
+
     picks_df = picks_df.drop(columns=["lb_rating"], errors="ignore")
     return picks_df
 
